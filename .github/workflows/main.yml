@@ -1,0 +1,166 @@
+name: Tailscale RDP (Multi-Instance)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; capped to 358)"
+        required: false
+        default: "358"
+      rdp_count:
+        description: "Number of RDP instances to run (1–10)"
+        required: false
+        default: "1"
+
+env:
+  RDP_USER: ${{ secrets.RDP_USER }}
+  RDP_PASS: ${{ secrets.RDP_PASS }}
+  TS_TAILNET: ${{ secrets.TS_TAILNET }}
+  TS_API_KEY: ${{ secrets.TS_API_KEY }}
+  TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+  TS_HOSTNAME_BASE: ${{ secrets.TS_HOSTNAME }}  # e.g., "mansingh"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      multi:  ${{ steps.mk.outputs.multi }}
+    steps:
+      - id: mk
+        run: |
+          $n = [int]"${{ inputs.rdp_count }}"
+          if ($n -lt 1) { $n = 1 }
+          if ($n -gt 10) { $n = 10 }
+          $inc = @()
+          for ($i = 1; $i -le $n; $i++) {
+            $inc += @{ id = $i }
+          }
+          $json = @{ include = $inc } | ConvertTo-Json -Compress
+          "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "multi=$($n -gt 1 ? '1' : '0')" | Out-File -Append $env:GITHUB_OUTPUT -Encoding utf8
+        shell: pwsh
+
+  secure-rdp:
+    needs: setup
+    runs-on: windows-2022
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 10
+    timeout-minutes: 3600
+
+    steps:
+      - name: Set Hostname & Runtime
+        run: |
+          $base = "${{ env.TS_HOSTNAME_BASE }}"
+          $hostname = if ("${{ needs.setup.outputs.multi }}" -eq "1") {
+            "$base"
+          } else {
+            "$base${{ matrix.id }}"
+          }
+          "TS_HOSTNAME=$hostname" | Out-File -Append $env:GITHUB_ENV
+
+          $mins = [int]"${{ inputs.runtime_minutes }}"
+          if ($mins -gt 358) { $mins = 358 }
+          "RUNTIME_MINUTES=$mins" | Out-File -Append $env:GITHUB_ENV
+
+          Write-Host "Instance ${{ matrix.id }}: Hostname=$hostname, Runtime=$mins min"
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          $password = "${{ env.RDP_PASS }}"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if ((Get-LocalUser -Name "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue) -eq $null) {
+            New-LocalUser -Name "${{ env.RDP_USER }}" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "${{ env.RDP_USER }}"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "${{ env.RDP_USER }}"
+
+          echo "RDP_CREDS=User: $env:RDP_USER | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Enable Windows Audio Service
+        shell: pwsh
+        run: |
+          Set-Service -Name "Audiosrv" -StartupType Automatic
+          Start-Service -Name "Audiosrv"
+      
+      - name: 🧹 PURGE any devices with base name prefix (once per run)
+        if: ${{ needs.setup.outputs.multi == '0' || matrix.id == 1 }}
+        run: |
+          $base = "${{ env.TS_HOSTNAME_BASE }}"
+          $hdr = @{ Authorization = "Bearer $env:TS_API_KEY" }
+          $tn  = [uri]::EscapeDataString("$env:TS_TAILNET")
+          $match = { param($d)
+            ($d.name -match "(?i)^${base}\d*$") -or
+            ($d.hostname -match "(?i)^${base}\d*$") -or
+            ($d.DNSName -match "(?i)^${base}\d*$")
+          }
+          try {
+            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
+            foreach ($d in $resp.devices) {
+              if (& $match $d) {
+                try {
+                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
+                  Write-Host "Deleted at start: $($d.name)"
+                } catch {}
+              }
+            }
+          } catch { Write-Warning "Startup purge failed: $_" }
+
+      - name: ⚙️ Install Tailscale (if missing) & show version
+        run: |
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+            $dst = "$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          & "C:\Program Files\Tailscale\tailscale.exe" version
+
+      - name: 🔗 Tailscale up (per instance) + show IP/FQDN/DERP
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts logout | Out-Null
+          & $ts up --authkey "$env:TS_AUTHKEY" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          Start-Sleep -Seconds 2
+
+          $ip4 = (& $ts ip -4 | Select-Object -First 1)
+          $status = & $ts status --json | ConvertFrom-Json
+          $fqdn = $status.Self.DNSName
+          $derp = $status.Self.DERP
+          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
+
+          "### RDP via Tailscale (Instance ${{ matrix.id }})`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nDERP: $derp`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS (Instance ${{ matrix.id }}) ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "==================`n"
+
+          $mins = [int]"${{ env.RUNTIME_MINUTES }}"
+          $end = (Get-Date).AddMinutes($mins)
+          while ((Get-Date) -lt $end) {
+            $left = [int]([math]::Ceiling(($end - (Get-Date)).TotalMinutes))
+            Write-Host "[$(Get-Date)] RDP Instance ${{ matrix.id }} alive... ($left min left)"
+            Start-Sleep -Seconds 60
+          }
