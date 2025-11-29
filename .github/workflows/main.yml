@@ -2,11 +2,6 @@ name: Tailscale
 
 on:
   workflow_dispatch:
-    inputs:
-      runtime_minutes:
-        description: "Runtime in minutes (max 360; capped to 358)"
-        required: false
-        default: "358"
 
 env:
   RDP_USER: ${{ secrets.RDP_USER }}
@@ -19,20 +14,9 @@ env:
 jobs:
   secure-rdp:
     runs-on: windows-2022
-    timeout-minutes: 370
+    timeout-minutes: 3600
 
     steps:
-      - name: Set Runtime Minutes
-        id: cfg
-        env:
-          RAW_RUNTIME: ${{ inputs.runtime_minutes || '358' }}
-        run: |
-          # Optionally process the RAW_RUNTIME value here if needed
-          $mins = [int]"${{ env.RAW_RUNTIME }}"
-          if ($mins -gt 358) { $mins = 358 }
-          echo "Setting runtime to $mins minutes"
-          echo "runtime=$mins" >> $env:GITHUB_OUTPUT
-
       - name: Configure Core RDP Settings
         run: |
           # Enable Remote Desktop and disable Network Level Authentication (if needed)
@@ -65,12 +49,6 @@ jobs:
 
           echo "RDP_CREDS=User: $env:RDP_USER | Password: $password" >> $env:GITHUB_ENV
 
-      - name: Enable Windows Audio Service
-        shell: pwsh
-        run: |
-          Set-Service -Name "Audiosrv" -StartupType Automatic
-          Start-Service -Name "Audiosrv"
-      
       - name: 🧹 PURGE any devices containing 'mansingh' (startup)
         run: |
           $hdr = @{ Authorization = "Bearer $env:TS_API_KEY" }
@@ -118,6 +96,16 @@ jobs:
 
           "### RDP via Tailscale`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nDERP: $derp`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS ==="
@@ -126,10 +114,7 @@ jobs:
           Write-Host "Password: $env:RDP_PASS"
           Write-Host "==================`n"
 
-          $mins=[int]"${{ steps.cfg.outputs.runtime }}"
-          $end=(Get-Date).AddMinutes($mins)
-          while((Get-Date) -lt $end){
-            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
-            Write-Host "[$(Get-Date)] ($left min left) RDP alive..."
-            Start-Sleep -Seconds 60
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
           }
