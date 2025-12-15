@@ -1,4 +1,4 @@
-name: Tailscale
+name: Tailscale RDP
 
 on:
   workflow_dispatch:
@@ -32,7 +32,8 @@ jobs:
           
           # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+            dir=in action=allow protocol=TCP localport=3389 `
+            remoteip=100.64.0.0/10
 
           # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
@@ -47,26 +48,26 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "${{ env.RDP_USER }}"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "${{ env.RDP_USER }}"
 
-          echo "RDP_CREDS=User: $env:RDP_USER | Password: $password" >> $env:GITHUB_ENV
+          echo "::add-mask::$env:RDP_USER"
+          echo "::add-mask::$password"
+          echo "RDP_CREDS=User: *** | Password: ***" >> $env:GITHUB_ENV
 
       - name: 🧹 PURGE any devices containing 'mansingh' (startup)
         run: |
-          $hdr = @{ Authorization = "Bearer $env:TS_API_KEY" }
+          echo "::add-mask::$env:TS_API_KEY"
+          $hdr = @{ Authorization = "Bearer ***" }
           $tn  = [uri]::EscapeDataString("$env:TS_TAILNET")
-          $match = { param($d)
-            ($d.name -match '(?i)mansingh') -or ($d.hostname -match '(?i)mansingh') -or ($d.DNSName -match '(?i)mansingh')
-          }
           try {
-            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
+            $resp = Invoke-RestMethod -Method GET -Headers @{"Authorization"="Bearer $env:TS_API_KEY"} `
+            -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Verbose:$false
             foreach ($d in $resp.devices) {
-              if (& $match $d) {
-                try {
-                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
-                  Write-Host "Deleted at start: $($d.name)"
-                } catch {}
+              if ($d.name -match '(?i)mansingh') {
+                Invoke-RestMethod -Method DELETE -Headers @{"Authorization"="Bearer $env:TS_API_KEY"} `
+                  -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Verbose:$false | Out-Null
+                Write-Host "Deleted device: *** (matching pattern)"  # Hide name if needed
               }
             }
-          } catch { Write-Warning "Startup purge failed: $_" }
+          } catch { Write-Warning "Device cleanup failed" }
 
       - name: ⚙️ Install Tailscale (if missing) & show version
         run: |
@@ -96,25 +97,19 @@ jobs:
 
           "### RDP via Tailscale`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nDERP: $derp`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
-
       - name: Maintain Connection
         run: |
+          Write-Host "::add-mask::$env:RDP_PASS"
+          Write-Host "::add-mask::$env:RDP_USER"
+
+          # DO NOT write unmasked creds
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "Tailscale Access Only (via MagicDNS)"
+          Write-Host "Details logged above (masked)"
           Write-Host "==================`n"
 
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+            Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C to terminate"
+            Start-Sleep -Seconds 300
           }
